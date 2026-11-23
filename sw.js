@@ -1,5 +1,5 @@
 // Offline cache for the app's own files. Food lookups (other sites) are never cached or touched here.
-const CACHE = 'intake-v1';
+const CACHE = 'intake-v2';
 
 self.addEventListener('install', () => self.skipWaiting());
 self.addEventListener('activate', e => e.waitUntil(

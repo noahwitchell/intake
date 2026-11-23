@@ -1,5 +1,5 @@
 import { load, save, backupBlob, readBackup } from './store.js';
-import { searchUSDA, usdaDetail, searchOFF, byBarcode } from './api.js';
+import { searchUSDA, usdaDetail, searchBranded, checkKey, byBarcode } from './api.js';
 import { scan } from './scanner.js';
 
 const C = globalThis.Core;
@@ -187,7 +187,7 @@ function viewSettings() {
   <section class="card form">
     <h2>USDA key</h2>
     <input class="field" data-set="usdaKey" value="${esc(s.usdaKey)}" placeholder="Paste your free key" autocomplete="off" autocapitalize="off" spellcheck="false">
-    <p class="note">Food search works without one, but USDA's shared demo key only allows a few searches an hour. A free personal key allows 1,000. Get one at <a href="https://fdc.nal.usda.gov/api-key-signup" target="_blank" rel="noopener">fdc.nal.usda.gov/api-key-signup</a>; it's emailed to you right away.</p>
+    <p class="note" id="key-status">${s.usdaKey ? '' : 'Food search runs on USDA’s database, which needs a free personal key (1,000 searches an hour). '}Get one at <a href="https://fdc.nal.usda.gov/api-key-signup" target="_blank" rel="noopener">fdc.nal.usda.gov/api-key-signup</a>: fill in your name and email, and the key arrives by email right away. Paste it here. Barcode scans work without it.</p>
   </section>
   <section class="card form">
     <h2>Backup</h2>
@@ -258,10 +258,10 @@ async function runOnline() {
   const ctl = search.ctl = new AbortController();
   search.loading = true; search.usda = search.off = null; search.usdaErr = search.offErr = '';
   paintResults();
-  const fail = e => (e.name === 'AbortError' ? null : e.code === 'limit' ? 'USDA limit reached. Add your free key in Settings.' : e.code === 'key' ? 'USDA key not accepted. Check it in Settings.' : e.message);
+  const fail = e => (e.name === 'AbortError' ? null : e.code === 'limit' ? (S.settings.usdaKey ? 'USDA hourly limit reached. Try again in a little while.' : 'USDA’s shared key is used up. Add your own free key in Settings.') : e.code === 'key' ? 'USDA key not accepted. Check it in Settings.' : e.message);
   await Promise.all([
     searchUSDA(S, q, ctl.signal).then(r => { search.usda = r; }, e => { search.usdaErr = fail(e); search.usda = []; }).finally(() => ctl === search.ctl && paintResults()),
-    searchOFF(q, ctl.signal).then(r => { search.off = r; }, e => { search.offErr = fail(e); search.off = []; }).finally(() => ctl === search.ctl && paintResults()),
+    searchBranded(S, q, ctl.signal).then(r => { search.off = r; }, e => { search.offErr = fail(e); search.off = []; }).finally(() => ctl === search.ctl && paintResults()),
   ]);
   if (ctl === search.ctl) { search.loading = false; paintResults(); }
 }
@@ -284,16 +284,19 @@ function paintResults() {
   const q = search.q.trim();
   const section = (title, list, state) => `<h3 class="res-h">${title}</h3>${state ? `<p class="res-note">${esc(state)}</p>` : ''}${list && list.length ? `<ul class="list">${list.map(resultRow).join('')}</ul>` : ''}`;
   let html = '';
-  if (!q) html += mine.length ? section('Recent', mine) : '<p class="res-note">Search for a food, or scan a barcode. Anything you log is saved here for next time.</p>';
+  if (!q) html += mine.length ? section('Recent', mine) : `<p class="res-note">Search for a food, or scan a barcode. Anything you log is saved here for next time.${S.settings.usdaKey ? '' : ' Online search needs your free USDA key (Settings).'}</p>`;
   else {
     if (mine.length) html += section('My foods', mine);
     const online = (list, err) => (err ? err : list == null ? (search.loading ? 'Searching…' : '') : list.length ? '' : 'Nothing found');
     // USDA generic results are per 100 g, so they show the 100 g figure.
-    if (search.usda == null && search.off == null && !search.loading) html += `<button class="btn wide online" data-act="online">Search USDA and Open Food Facts for “${esc(q)}”</button>`;
-    else {
-      html += section('Basic foods · USDA', search.usda, online(search.usda, search.usdaErr));
-      html += section('Packaged · Open Food Facts', search.off, online(search.off, search.offErr));
+    if (search.usda == null && search.off == null && !search.loading) html += `<button class="btn wide online" data-act="online">Search online for “${esc(q)}”</button>`;
+    else if (search.usdaErr && search.usdaErr === search.offErr) {
+      html += `<p class="res-note">${esc(search.usdaErr)}</p>`;
+    } else {
+      html += section('Basic foods', search.usda, online(search.usda, search.usdaErr));
+      html += section('Packaged foods', search.off, online(search.off, search.offErr));
     }
+    if (/Settings/.test(search.usdaErr + search.offErr)) html += '<button class="btn wide" data-act="go-key">Add my USDA key</button>';
   }
   el.innerHTML = html;
 }
@@ -563,6 +566,7 @@ document.addEventListener('click', e => {
   if (a === 'breakdown') return openBreakdown();
   if (a === 'scan') return openScanner();
   if (a === 'online') return runOnline();
+  if (a === 'go-key') { closeSheet(); ui.tab = 'settings'; render(); const k = $('[data-set=usdaKey]'); if (k) { k.scrollIntoView({ block: 'center' }); k.focus(); } return; }
   if (a === 'custom') return openCustom({ meal: search.meal });
   if (a === 'weigh') return openWeigh();
   if (a === 'export') return exportBackup();
@@ -580,6 +584,16 @@ document.addEventListener('click', e => {
   if (wr) return openWeigh(wr.dataset.weight);
   const un = t.closest('[data-unit]');
   if (un) { S.settings.wUnit = un.dataset.unit; commit(); return render(); }
+});
+
+// Check a pasted USDA key once you leave the field.
+document.addEventListener('change', async e => {
+  if (!e.target.dataset || e.target.dataset.set !== 'usdaKey') return;
+  const k = e.target.value.trim(), st = $('#key-status');
+  if (!k || !st) return;
+  st.textContent = 'Checking key…';
+  const r = await checkKey(k);
+  st.textContent = r === 'ok' ? 'Key works. Food search is ready.' : r === 'limit' ? 'Key accepted, but its hourly limit is used up. It resets within the hour.' : r === 'offline' ? 'Couldn’t reach USDA to check the key. It’s saved; try a search later.' : 'USDA didn’t accept that key. Check it was pasted in full.';
 });
 
 // Settings fields save as you type.

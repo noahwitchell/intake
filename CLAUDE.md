@@ -9,9 +9,9 @@
   Foods store nutrients per base unit (100 g for USDA/OFF, 1 serving for typed-in foods) and portions as
   multiples of that base. Entries keep their own scaled nutrients so history survives edits to the food.
   Never change the shape without a migration in `Core.normalize`.
-- Lookups (js/api.js): USDA FoodData Central (generic foods, needs the user's free key in Settings;
-  DEMO_KEY allows only a few calls an hour) and Open Food Facts (packaged + barcodes, no key, ~10 searches
-  a minute, so online search runs only when Search is pressed). Only the query or barcode leaves the phone.
+- Lookups (js/api.js): USDA FoodData Central for all name search (generic + Branded), needs the user's free key in Settings;
+  DEMO_KEY runs out fast. Open Food Facts = barcodes only: its name search 503s without CORS headers when busy
+  (browser sees "Failed to fetch"). Online search runs only when Search is pressed. Only the query or barcode leaves the phone.
 - Barcodes (js/scanner.js): native BarcodeDetector if present, else vendored barcode-detector 3.2.3 +
   zxing-wasm 3.1.6 reader in vendor/ (wasm served locally, never from a CDN).
 - Removing data = hold to confirm. Controls keep their size and place.

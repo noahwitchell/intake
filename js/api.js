@@ -20,7 +20,7 @@ async function getJSON(url, signal) {
   catch (e) {
     if (signal && signal.aborted) throw e;
     if (ctl.signal.reason === 'timeout') throw new LookupError('Took too long, try again', 'timeout');
-    throw new LookupError('No connection', 'offline');
+    throw navigator.onLine === false ? new LookupError('No connection', 'offline') : new LookupError('The food database didn’t answer. Try again in a moment.', 'down');
   } finally { clearTimeout(t); if (signal) signal.removeEventListener('abort', onAbort); }
   if (r.status === 429) throw new LookupError('Hourly limit reached', 'limit');
   if (r.status === 503) throw new LookupError('Busy right now, try again in a minute', 'busy');
@@ -34,8 +34,14 @@ const key = s => encodeURIComponent((s.settings.usdaKey || '').trim() || 'DEMO_K
 
 // Plain foods (banana, chicken breast, rice): USDA's generic and survey data.
 export async function searchUSDA(s, q, signal) {
-  const url = `${USDA}/foods/search?api_key=${key(s)}&pageSize=20&${GENERIC}&query=${encodeURIComponent(q)}`;
-  const d = await getJSON(url, signal);
+  const base = `${USDA}/foods/search?api_key=${key(s)}&pageSize=20&query=${encodeURIComponent(q)}`;
+  let d;
+  try { d = await getJSON(`${base}&${GENERIC}`, signal); }
+  catch (e) {
+    // If USDA ever rejects the three-type request, fall back to the two core types (known good).
+    if (e.code !== 'http') throw e;
+    d = await getJSON(`${base}&dataType=Foundation,SR%20Legacy`, signal);
+  }
   return (d && d.foods || []).map(C.fromUSDA).filter(C.usable);
 }
 
@@ -45,12 +51,20 @@ export async function usdaDetail(s, fdcId, signal) {
   return d ? C.fromUSDA(d) : null;
 }
 
-// Packaged foods sold in the US, by name. OFF allows about 10 searches a minute, so the app
-// only searches online when you press Search.
-export async function searchOFF(q, signal) {
-  const url = `https://world.openfoodfacts.org/cgi/search.pl?search_simple=1&json=1&page_size=20&tagtype_0=countries&tag_contains_0=contains&tag_0=united-states&fields=${OFF_FIELDS}&search_terms=${encodeURIComponent(q)}`;
+// Packaged foods by name: USDA's branded list (about 400,000 US products). Open Food Facts'
+// name search turns browsers away whenever it's busy, so it is used for barcodes only.
+export async function searchBranded(s, q, signal) {
+  const url = `${USDA}/foods/search?api_key=${key(s)}&pageSize=20&dataType=Branded&query=${encodeURIComponent(q)}`;
   const d = await getJSON(url, signal);
-  return (d && d.products || []).filter(p => p.code).map(C.fromOFF).filter(C.usable);
+  return (d && d.foods || []).map(C.fromUSDA).filter(C.usable);
+}
+
+// True if USDA accepts this key.
+export async function checkKey(k) {
+  try {
+    const r = await fetch(`${USDA}/foods/search?api_key=${encodeURIComponent(k)}&pageSize=1&query=apple`);
+    return r.ok ? 'ok' : r.status === 429 ? 'limit' : 'bad';
+  } catch { return 'offline'; }
 }
 
 // Barcode: Open Food Facts first, then USDA's branded foods (which list UPCs too).
