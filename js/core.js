@@ -44,6 +44,7 @@
       days: {},    // 'YYYY-MM-DD' -> [entry]
       weights: [], // { id, date, kg }
       settings: { kcal: 2000, protein: null, carbs: null, fat: null, wUnit: 'lb', usdaKey: '' },
+      draft: null, // recipe being built, kept so leaving the app doesn't lose it
     };
   }
 
@@ -56,6 +57,7 @@
       days: s.days && typeof s.days === 'object' ? s.days : {},
       weights: Array.isArray(s.weights) ? s.weights.filter(w => w && w.date && num(w.kg) != null) : [],
       settings: { ...e.settings, ...(s.settings || {}) },
+      draft: s.draft && typeof s.draft === 'object' && Array.isArray(s.draft.items) ? s.draft : null, // unsaved recipe
     };
     for (const k of Object.keys(out.days)) if (!Array.isArray(out.days[k])) delete out.days[k];
     out.weights.sort((a, b) => a.date.localeCompare(b.date));
@@ -208,6 +210,27 @@
 
   const usable = f => f && f.n && f.n.kcal != null;
 
+  // ---------- recipes ----------
+  // A recipe is a food whose base unit is one serving. items are entry-shaped ingredients
+  // ({ foodId, name, qty, portion, mult, n }); an item with foodId null is a line still to be matched.
+  const recipeTotal = items => sumN((items || []).filter(i => i.foodId).map(i => i.n));
+  function recipeFood({ id, name, servings, items, site }) {
+    const sv = num(servings) > 0 ? num(servings) : 1;
+    const per = scaleN(recipeTotal(items), 1 / sv);
+    return {
+      id: id || 'rcp:' + uid(),
+      name: String(name || '').trim() || 'My recipe',
+      brand: '',
+      barcode: '',
+      src: 'recipe',
+      servings: sv,
+      items: (items || []).map(i => ({ ...i })),
+      site: site || null,
+      n: cleanN(per),
+      portions: [{ label: 'serving', mult: 1 }, { label: `whole recipe (${round(sv, 2)} servings)`, mult: sv }],
+    };
+  }
+
   // ---------- log entries ----------
   function makeEntry(food, qty, portionIdx, meal) {
     const p = food.portions[portionIdx] || food.portions[0];
@@ -279,7 +302,7 @@
     uid, num, round, emptyState, normalize,
     dateKey, parseKey, addDays, daysBetween,
     cleanN, scaleN, sumN, fixCase,
-    fromUSDA, fromOFF, customFood, usable,
+    fromUSDA, fromOFF, customFood, usable, recipeFood, recipeTotal,
     makeEntry, reweigh, dayTotals, mealTotals,
     recentFoods, searchMine, findBarcode, normBarcode,
     toKg, fromKg, trend,

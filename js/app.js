@@ -2,7 +2,7 @@ import { load, save, backupBlob, readBackup } from './store.js';
 import { searchUSDA, usdaDetail, searchBranded, checkKey, byBarcode } from './api.js';
 import { scan } from './scanner.js';
 
-const C = globalThis.Core;
+const C = globalThis.Core, I = globalThis.Import;
 const $ = (sel, root = document) => root.querySelector(sel);
 const app = $('#app'), sheetEl = $('#sheet'), sheetBody = $('.sheet-body');
 
@@ -35,8 +35,9 @@ function defaultMeal() {
   const h = new Date().getHours();
   return h < 11 ? 'breakfast' : h < 15 ? 'lunch' : h < 21 ? 'dinner' : 'snacks';
 }
-const srcName = { usda: 'USDA', off: 'Open Food Facts', custom: 'My food' };
-const foodSub = f => [f.brand, srcName[f.src]].filter(Boolean).join(' · ');
+const srcName = { usda: 'USDA', off: 'Open Food Facts', custom: 'My food', recipe: 'Recipe' };
+const foodSub = f => f.src === 'recipe' ? `Recipe · makes ${C.round(f.servings, 2)} serving${f.servings === 1 ? '' : 's'}` : [f.brand, srcName[f.src]].filter(Boolean).join(' · ');
+const lookupMsg = e => (e.name === 'AbortError' ? null : e.code === 'limit' ? (S.settings.usdaKey ? 'USDA hourly limit reached. Try again in a little while.' : 'USDA’s shared key is used up. Add your own free key in Settings.') : e.code === 'key' ? 'USDA key not accepted. Check it in Settings.' : e.message);
 
 let toastT = 0;
 function toast(msg) {
@@ -190,6 +191,12 @@ function viewSettings() {
     <p class="note" id="key-status">${s.usdaKey ? '' : 'Food search runs on USDA’s database, which needs a free personal key (1,000 searches an hour). '}Get one at <a href="https://fdc.nal.usda.gov/api-key-signup" target="_blank" rel="noopener">fdc.nal.usda.gov/api-key-signup</a>: fill in your name and email, and the key arrives by email right away. Paste it here. Barcode scans work without it.</p>
   </section>
   <section class="card form">
+    <h2>Copy pages from Safari</h2>
+    <p class="note">Recipe and restaurant sites don’t let apps read their pages, so Intake reads what you copy. The Copy to Intake shortcut copies a whole page in one tap from Safari’s Share menu, including the recipe data most recipe sites hide in the page.</p>
+    <p class="note">1. Open <a href="shortcut/Copy-to-Intake.shortcut" target="_blank" rel="noopener">the shortcut</a> and tap Add Shortcut.<br>2. On a recipe or nutrition page in Safari, tap Share › Copy to Intake. Allow it when it asks.<br>3. Back here: + › Paste a recipe or nutrition facts › Paste › Read it.</p>
+    <p class="note">If Shortcuts says scripts aren’t allowed: iPhone Settings › Apps › Shortcuts › Advanced › Allow Running Scripts.</p>
+  </section>
+  <section class="card form">
     <h2>Backup</h2>
     <p class="note">${nDays} day${nDays === 1 ? '' : 's'} logged, ${nFoods} saved food${nFoods === 1 ? '' : 's'}, ${S.weights.length} weigh-in${S.weights.length === 1 ? '' : 's'}. Everything stays on this phone, so save a backup now and then (to Files or Dropbox).</p>
     <div class="btns">
@@ -198,7 +205,7 @@ function viewSettings() {
     </div>
     <div id="restore-confirm"></div>
   </section>
-  <p class="about">Intake keeps your log on this device only. Looking up a food sends just the words you type, or the barcode number, to USDA FoodData Central or Open Food Facts.</p>
+  <p class="about">Intake keeps your log on this device only. Looking up a food sends just the words you type, or the barcode number, to USDA FoodData Central or Open Food Facts. Pasted recipes and nutrition facts are read on the phone; only the ingredient names are looked up.</p>
   <div class="spacer"></div>`;
 }
 
@@ -225,16 +232,25 @@ const sheetHead = (title, back) => `<div class="sh-head">
 
 // --- add food: search your foods, USDA and Open Food Facts ---
 const search = { q: '', meal: 'breakfast', usda: null, off: null, usdaErr: '', offErr: '', loading: false, ctl: null, results: new Map() };
+// pick = null when logging food; { replace, ing } while choosing a recipe ingredient
+// (replace = index of the line being matched, ing = that line parsed, for the starting amount).
+let pick = null;
 
 function openAdd(meal) {
   search.meal = meal || defaultMeal();
-  openSheet(`${sheetHead('Add to ' + C.MEALS.find(m => m.k === search.meal).label)}
+  const title = pick ? (pick.replace != null ? 'Pick the food' : 'Add ingredient') : 'Add to ' + C.MEALS.find(m => m.k === search.meal).label;
+  openSheet(`${sheetHead(title, pick ? 'recipe' : null)}
+    ${pick && pick.ing ? `<p class="sub">For “${esc(pick.ing.raw)}”</p>` : ''}
     <form class="searchbar" id="sform">
       <input class="field" id="q" type="search" placeholder="Search foods" value="${esc(search.q)}" autocomplete="off" enterkeyhint="search">
       <button type="button" class="scan-btn" data-act="scan" aria-label="Scan a barcode">${scanIcon}</button>
     </form>
     <div class="results" id="results"></div>
-    <button class="btn wide ghost" data-act="custom">Enter a food by hand</button>`, body => {
+    ${pick ? '<button class="btn wide ghost" data-act="custom">Enter a food by hand</button>' : `<div class="btns">
+      <button class="btn ghost" data-act="custom">Enter by hand</button>
+      <button class="btn ghost" data-act="new-recipe">New recipe</button>
+    </div>
+    <button class="btn wide ghost" data-act="import">Paste a recipe or nutrition facts</button>`}`, body => {
     const q = $('#q', body);
     let deb = 0;
     q.addEventListener('input', () => {
@@ -247,6 +263,7 @@ function openAdd(meal) {
     $('#sform', body).addEventListener('submit', e => { e.preventDefault(); clearTimeout(deb); q.blur(); runOnline(); });
     paintResults();
     if (!search.q) setTimeout(() => q.focus(), 250);
+    else if (pick && search.usda == null && search.q.trim().length >= 2) runOnline();
     return () => clearTimeout(deb);
   });
 }
@@ -258,7 +275,7 @@ async function runOnline() {
   const ctl = search.ctl = new AbortController();
   search.loading = true; search.usda = search.off = null; search.usdaErr = search.offErr = '';
   paintResults();
-  const fail = e => (e.name === 'AbortError' ? null : e.code === 'limit' ? (S.settings.usdaKey ? 'USDA hourly limit reached. Try again in a little while.' : 'USDA’s shared key is used up. Add your own free key in Settings.') : e.code === 'key' ? 'USDA key not accepted. Check it in Settings.' : e.message);
+  const fail = lookupMsg;
   await Promise.all([
     searchUSDA(S, q, ctl.signal).then(r => { search.usda = r; }, e => { search.usdaErr = fail(e); search.usda = []; }).finally(() => ctl === search.ctl && paintResults()),
     searchBranded(S, q, ctl.signal).then(r => { search.off = r; }, e => { search.offErr = fail(e); search.off = []; }).finally(() => ctl === search.ctl && paintResults()),
@@ -280,7 +297,7 @@ function paintResults() {
   const el = $('#results');
   if (!el) return;
   search.results.clear();
-  const mine = C.searchMine(S, search.q);
+  const mine = C.searchMine(S, search.q).filter(f => !pick || f.src !== 'recipe');
   const q = search.q.trim();
   const section = (title, list, state) => `<h3 class="res-h">${title}</h3>${state ? `<p class="res-note">${esc(state)}</p>` : ''}${list && list.length ? `<ul class="list">${list.map(resultRow).join('')}</ul>` : ''}`;
   let html = '';
@@ -307,6 +324,10 @@ async function openFood(f, { meal, back = 'add', note = '' } = {}) {
   let food = S.foods[f.id] || f;
   let pi = food.lastPortion != null && food.portions[food.lastPortion] ? food.lastPortion : 0;
   let qty = food.lastQty || 1;
+  const forRecipe = !!pick, ing = pick && pick.ing;
+  // An ingredient line ("1 ½ cups flour") sets the starting amount.
+  const fromLine = () => { if (ing) { const r = I.pickPortion(food, ing); pi = r.pi; qty = r.qty; } };
+  if (forRecipe) { pi = 0; qty = 1; fromLine(); }
   const draw = () => `${sheetHead(food.name, back)}
     ${note ? `<p class="flash">${esc(note)}</p>` : ''}
     <p class="sub">${esc(foodSub(food))}${food.barcode ? ` · ${esc(food.barcode)}` : ''}</p>
@@ -315,9 +336,10 @@ async function openFood(f, { meal, back = 'add', note = '' } = {}) {
       <select class="field" id="portion" aria-label="Portion">${food.portions.map((p, i) => `<option value="${i}"${i === pi ? ' selected' : ''}>${esc(p.label)}</option>`).join('')}</select>
     </div>
     <div id="preview"></div>
-    <div class="seg meals">${C.MEALS.map(m => `<button class="${m.k === meal ? 'on' : ''}" data-meal="${m.k}">${m.label}</button>`).join('')}</div>
-    <button class="btn primary wide" id="add-go">Add to ${esc(ui.day === C.dateKey() ? 'today' : dayLabel(ui.day))}</button>
-    ${food.src === 'custom' ? '<button class="btn wide ghost" id="edit-food">Edit this food</button>' : ''}`;
+    ${forRecipe ? '' : `<div class="seg meals">${C.MEALS.map(m => `<button class="${m.k === meal ? 'on' : ''}" data-meal="${m.k}">${m.label}</button>`).join('')}</div>`}
+    <button class="btn primary wide" id="add-go">${forRecipe ? 'Add to recipe' : `Add to ${esc(ui.day === C.dateKey() ? 'today' : dayLabel(ui.day))}`}</button>
+    ${food.src === 'custom' ? '<button class="btn wide ghost" id="edit-food">Edit this food</button>' : ''}
+    ${food.src === 'recipe' && !forRecipe ? '<button class="btn wide ghost" id="edit-recipe">Edit recipe</button>' : ''}`;
   const mount = body => {
     const qEl = $('#qty', body), pEl = $('#portion', body);
     const upd = () => {
@@ -334,6 +356,7 @@ async function openFood(f, { meal, back = 'add', note = '' } = {}) {
     });
     $('#add-go', body).addEventListener('click', () => {
       if (!(qty > 0)) return;
+      if (forRecipe) return addIngredient(food, qty, pi);
       const saved = { ...food, uses: (food.uses || 0) + 1, last: new Date().toISOString(), lastQty: qty, lastPortion: pi };
       S.foods[food.id] = saved;
       (S.days[ui.day] ||= []).push(C.makeEntry(saved, qty, pi, meal));
@@ -342,6 +365,8 @@ async function openFood(f, { meal, back = 'add', note = '' } = {}) {
     });
     const ed = $('#edit-food', body);
     if (ed) ed.addEventListener('click', () => openCustom({ food, meal }));
+    const er = $('#edit-recipe', body);
+    if (er) er.addEventListener('click', () => editRecipe(food));
     upd();
   };
   openSheet(draw(), mount);
@@ -354,6 +379,7 @@ async function openFood(f, { meal, back = 'add', note = '' } = {}) {
         if (S.foods[food.id]) { S.foods[food.id] = { ...S.foods[food.id], portions: food.portions, full: true }; commit(); }
         const keepQty = $('#qty').value;
         pi = 0; qty = C.num(keepQty) || 1;
+        if (forRecipe) fromLine();
         // Prefer a household measure (cup, medium) over grams when one exists.
         openSheet(draw(), mount);
       }
@@ -418,11 +444,11 @@ function openEntry(id) {
 
 // --- type a food in from its label ---
 const CUSTOM_MORE = ['satfat', 'transfat', 'fiber', 'sugar', 'chol', 'sodium', 'potassium', 'calcium', 'iron', 'vitA', 'vitC', 'vitD'];
-function openCustom({ food = null, barcode = '', meal, note = '' } = {}) {
-  const f = food || {};
+function openCustom({ food = null, prefill = null, barcode = '', meal, note = '' } = {}) {
+  const f = food || prefill || {};
   const v = k => (f.n && f.n[k] != null ? C.round(f.n[k], 2) : '');
   const nf = (k, req) => `<label class="nf"><span>${N[k].label}${N[k].unit === 'kcal' ? '' : ` (${N[k].unit})`}${req ? ' *' : ''}</span><input class="field num" inputmode="decimal" data-n="${k}" value="${v(k)}"></label>`;
-  openSheet(`${sheetHead(food ? 'Edit food' : 'Enter a food', food ? null : 'add')}
+  openSheet(`${sheetHead(food ? 'Edit food' : prefill ? 'Check and save' : 'Enter a food', food ? null : 'add')}
     ${note ? `<p class="flash">${esc(note)}</p>` : ''}
     <div class="form">
       <input class="field" id="c-name" placeholder="Name *" value="${esc(f.name || '')}" autocomplete="off">
@@ -452,6 +478,272 @@ function openCustom({ food = null, barcode = '', meal, note = '' } = {}) {
     });
     if (food) holdActions['forget-food'] = () => { delete S.foods[food.id]; commit(); closeSheet(); render(); toast('Forgotten. Past log entries stay.'); };
   });
+}
+
+// ---------- recipes ----------
+// The recipe being built lives in S.draft (saved), so switching to Safari and back keeps it.
+const blankDraft = () => ({ id: null, name: '', servings: null, items: [], site: null });
+function newRecipe() {
+  if (!S.draft || S.draft.id) { S.draft = blankDraft(); commit(); }
+  openRecipe();
+}
+function editRecipe(food) {
+  if (!S.draft || S.draft.id !== food.id) {
+    S.draft = { id: food.id, name: food.name, servings: food.servings, items: (food.items || []).map(i => ({ ...i })), site: food.site || null };
+    commit();
+  }
+  openRecipe();
+}
+// A line from a pasted recipe, not yet matched to a food.
+function rawItem(raw) {
+  const p = I.parseIngredient(raw);
+  return { id: C.uid(), foodId: null, raw, name: raw, n: {}, skip: p.tiny || (p.qty == null && p.unit == null) };
+}
+
+const match = { ctl: null, busy: 0, err: '' };
+function openRecipe() {
+  pick = null;
+  const d = S.draft;
+  if (!d) return closeSheet();
+  openSheet(`${sheetHead(d.id ? 'Edit recipe' : 'New recipe')}
+    <div class="form">
+      <input class="field" id="r-name" placeholder="Recipe name *" value="${esc(d.name)}" autocomplete="off">
+      <label class="row"><span>Servings it makes</span><input class="field num" id="r-serv" inputmode="decimal" value="${d.servings ?? ''}" placeholder="1"></label>
+    </div>
+    <h3 class="res-h">Per serving</h3>
+    <div id="r-pv"></div>
+    <p class="res-note" id="r-note"></p>
+    <h3 class="res-h">Ingredients</h3>
+    <ul class="entries r-items" id="r-items"></ul>
+    <button class="add-row r-add" data-act="r-add"><span class="plus">+</span> Add ingredient</button>
+    <button class="btn primary wide" id="r-save">Save recipe</button>
+    <button class="btn danger hold wide" data-hold="r-drop">${d.id ? 'Hold to delete this recipe' : 'Hold to discard'}</button>`, body => {
+    $('#r-name', body).addEventListener('input', e => { d.name = e.target.value; commit(); paintRecipe(); });
+    $('#r-serv', body).addEventListener('input', e => { d.servings = C.num(e.target.value) > 0 ? C.num(e.target.value) : null; commit(); paintRecipe(); });
+    $('#r-save', body).addEventListener('click', saveRecipe);
+    holdActions['r-drop'] = () => {
+      if (match.ctl) match.ctl.abort();
+      if (d.id) delete S.foods[d.id];
+      S.draft = null; commit(); closeSheet(); render(); toast(d.id ? 'Recipe deleted. Past log entries stay.' : 'Discarded');
+    };
+    paintRecipe();
+  });
+}
+
+function paintRecipe() {
+  const d = S.draft, list = $('#r-items');
+  if (!d || !list) return;
+  const sv = d.servings || 1;
+  $('#r-pv').innerHTML = preview(C.scaleN(C.recipeTotal(d.items), 1 / sv));
+  const open = d.items.filter(i => !i.foodId && !i.skip && !i.matching).length;
+  const check = d.items.filter(i => i.foodId && i.check).length;
+  const notes = [];
+  if (match.busy) notes.push(`Finding foods for ${match.busy} line${match.busy === 1 ? '' : 's'}…`);
+  if (match.err) notes.push(match.err);
+  if (open) notes.push(`${open} line${open === 1 ? '' : 's'} still need${open === 1 ? 's' : ''} a food. Tap to pick one.`);
+  if (check) notes.push(`${check} amount${check === 1 ? ' was a guess' : 's were guesses'}. Worth a look.`);
+  if (d.site && d.site.kcal != null) notes.push(`The recipe page says ${commas(d.site.kcal)} kcal a serving.`);
+  if (!d.items.length) notes.push('Add each ingredient with the amount the whole recipe uses.');
+  $('#r-note').textContent = notes.join(' ');
+  list.innerHTML = d.items.map((it, i) => {
+    if (it.foodId) return `<li><button class="entry" data-item="${i}">
+      <span class="e-name">${esc(it.name)}<small${it.check ? ' class="warn"' : ''}>${esc(portionText(it))}${it.check ? ` · check: “${esc(it.raw)}”` : ''}</small></span>
+      <span class="e-k">${commas(it.n.kcal || 0)}</span></button></li>`;
+    return `<li><button class="entry todo" data-item="${i}">
+      <span class="e-name">${esc(it.raw)}<small${it.skip ? '' : ' class="warn"'}>${it.matching ? 'Finding a match…' : it.skip ? 'Not counted (no amount). Tap to add it.' : 'Tap to pick the food'}</small></span>
+      <span class="e-k">–</span></button></li>`;
+  }).join('');
+  $('#r-save').disabled = !(d.name.trim() && d.items.some(i => i.foodId));
+}
+
+function saveRecipe() {
+  const d = S.draft;
+  if (!d || !d.name.trim()) return;
+  if (match.ctl) match.ctl.abort();
+  const f = C.recipeFood(d);
+  const old = S.foods[f.id] || {};
+  S.foods[f.id] = { ...f, uses: old.uses || 0, last: old.last || new Date().toISOString(), lastQty: old.lastQty, lastPortion: old.lastPortion };
+  S.draft = null; commit(); render();
+  openFood(S.foods[f.id], { back: null, note: 'Recipe saved. Log a serving now, or find it under My foods any time.' });
+}
+
+// Chosen in the ingredient search: add it, or fill in the line being matched.
+function addIngredient(food, qty, pi) {
+  const d = S.draft;
+  if (!d) return closeSheet();
+  if (!S.foods[food.id]) S.foods[food.id] = { ...food, uses: 0 };
+  const it = { ...C.makeEntry(food, qty, pi, null) };
+  if (pick && pick.replace != null && d.items[pick.replace]) {
+    const was = d.items[pick.replace];
+    d.items[pick.replace] = { ...it, id: was.id, raw: was.raw };
+  } else d.items.push(it);
+  commit(); openRecipe();
+}
+
+function openItem(idx) {
+  const d = S.draft, it = d && d.items[+idx];
+  if (!it) return;
+  if (!it.foodId) {
+    // Unmatched line: search for it straight away.
+    pick = { replace: +idx, ing: I.parseIngredient(it.raw) };
+    search.q = pick.ing.name || it.raw; search.usda = search.off = null; search.usdaErr = search.offErr = '';
+    return openAdd(search.meal);
+  }
+  const food = S.foods[it.foodId];
+  const portions = food ? food.portions : [{ label: it.portion, mult: it.mult }];
+  let pi = Math.max(0, portions.findIndex(p => p.label === it.portion)), qty = it.qty;
+  openSheet(`${sheetHead(it.name, 'recipe')}
+    ${it.raw ? `<p class="sub">From “${esc(it.raw)}”</p>` : ''}
+    <div class="amount">
+      <input class="field num" id="qty" inputmode="decimal" value="${qtyText(qty)}" aria-label="Amount">
+      <select class="field" id="portion" aria-label="Portion">${portions.map((p, i) => `<option value="${i}"${i === pi ? ' selected' : ''}>${esc(p.label)}</option>`).join('')}</select>
+    </div>
+    <div id="preview"></div>
+    <button class="btn primary wide" id="save">Save</button>
+    <div class="btns">
+      <button class="btn" id="swap">Pick a different food</button>
+      <button class="btn danger hold" data-hold="r-remove">Hold to remove</button>
+    </div>`, body => {
+    const qEl = $('#qty', body), pEl = $('#portion', body);
+    const cur = () => C.reweigh(it, qty, portions[pi]);
+    const upd = () => { qty = C.num(qEl.value) || 0; pi = +pEl.value; $('#preview', body).innerHTML = preview(qty > 0 ? cur().n : {}); $('#save', body).disabled = !(qty > 0); };
+    qEl.addEventListener('input', upd); pEl.addEventListener('change', upd);
+    qEl.addEventListener('focus', () => qEl.select());
+    $('#save', body).addEventListener('click', () => { d.items[+idx] = { ...cur(), check: false }; commit(); openRecipe(); });
+    $('#swap', body).addEventListener('click', () => {
+      pick = { replace: +idx, ing: it.raw ? I.parseIngredient(it.raw) : null };
+      search.q = pick.ing ? pick.ing.name : it.name; search.usda = search.off = null; search.usdaErr = search.offErr = '';
+      openAdd(search.meal);
+    });
+    holdActions['r-remove'] = () => { d.items.splice(+idx, 1); commit(); openRecipe(); };
+    upd();
+  });
+}
+
+// Match pasted lines to foods: your own foods first, then USDA's first hit, then an amount from the line.
+async function findFood(ing, signal) {
+  const words = ing.name.toLowerCase().split(/\s+/).filter(w => w.length > 1);
+  if (!words.length) return null;
+  const mine = Object.values(S.foods).filter(f => f.src !== 'recipe' && C.usable(f) && words.every(w => new RegExp('\\b' + w.replace(/[^a-z0-9]/g, '') + '(e?s)?\\b').test(`${f.name} ${f.brand}`.toLowerCase())))
+    .sort((a, b) => (b.uses || 0) - (a.uses || 0))[0];
+  if (mine) return mine;
+  const list = await searchUSDA(S, ing.name, signal);
+  let f = I.rankFoods(ing.name, list)[0];
+  if (!f) return null;
+  if (f.kind !== 'Branded') {
+    try {
+      const det = await usdaDetail(S, f.fdcId, signal);
+      if (det && C.usable(det)) f = { ...f, ...det, full: true, n: Object.keys(det.n).length >= Object.keys(f.n).length ? det.n : f.n };
+    } catch (e) { if (e.name === 'AbortError') throw e; }
+  }
+  return f;
+}
+async function matchDraft() {
+  const d = S.draft;
+  if (!d) return;
+  if (match.ctl) match.ctl.abort();
+  const ctl = match.ctl = new AbortController();
+  match.err = '';
+  const todo = d.items.filter(i => !i.foodId && !i.skip);
+  todo.forEach(i => { i.matching = true; });
+  match.busy = todo.length; paintRecipe();
+  let next = 0, stop = false;
+  const worker = async () => {
+    while (!stop && next < todo.length) {
+      const it = todo[next++];
+      const ing = I.parseIngredient(it.raw);
+      try {
+        const f = await findFood(ing, ctl.signal);
+        if (S.draft !== d || ctl.signal.aborted) return;
+        if (f) {
+          if (!S.foods[f.id]) S.foods[f.id] = { ...f, uses: 0 };
+          const r = I.pickPortion(f, ing);
+          const i = d.items.indexOf(it);
+          if (i >= 0) d.items[i] = { ...C.makeEntry(f, r.qty, r.pi, null), id: it.id, raw: it.raw, check: !r.sure };
+        }
+      } catch (e) {
+        if (e.name === 'AbortError') return;
+        if (e.code === 'limit' || e.code === 'key' || e.code === 'offline') { stop = true; match.err = lookupMsg(e); }
+      }
+      it.matching = false; match.busy = Math.max(0, match.busy - 1);
+      commit(); paintRecipe();
+    }
+  };
+  await Promise.all([worker(), worker(), worker()]);
+  if (match.ctl === ctl) {
+    d.items.forEach(i => { delete i.matching; });
+    match.busy = 0; commit(); paintRecipe();
+  }
+}
+
+// ---------- import: pasted recipe or nutrition facts ----------
+const imp = { mode: 'recipe' };
+const IMP_HELP = {
+  recipe: 'Copy the ingredient list from a recipe page (the whole page is fine) and paste it here. Each line gets matched to a food, and you check the matches before saving.',
+  nutrition: 'Copy the nutrition facts for one item from a restaurant’s site, PDF or menu and paste them here. The numbers fill in a food you check before saving.',
+};
+function openImport() {
+  pick = null;
+  openSheet(`${sheetHead('Paste and import', 'add')}
+    <div class="seg">${[['recipe', 'Recipe'], ['nutrition', 'Nutrition facts']].map(([k, l]) => `<button class="${imp.mode === k ? 'on' : ''}" data-imp="${k}">${l}</button>`).join('')}</div>
+    <textarea class="field area" id="imp-text" placeholder="Paste here" autocomplete="off" spellcheck="false"></textarea>
+    <div class="btns">
+      <button class="btn" data-act="paste">Paste</button>
+      <button class="btn primary" id="imp-go">Read it</button>
+    </div>
+    <p class="flash" id="imp-msg" hidden></p>
+    <p class="note" id="imp-help">${IMP_HELP[imp.mode]}</p>
+    <p class="note">In Safari, the Copy to Intake shortcut in the Share menu copies a whole recipe or menu page in one tap. Set it up in Settings.</p>`, body => {
+    const ta = $('#imp-text', body), go = $('#imp-go', body);
+    const check = () => { go.disabled = !ta.value.trim(); };
+    ta.addEventListener('input', check); check();
+    body.addEventListener('click', e => {
+      const b = e.target.closest('[data-imp]');
+      if (!b) return;
+      imp.mode = b.dataset.imp;
+      body.querySelectorAll('[data-imp]').forEach(x => x.classList.toggle('on', x === b));
+      $('#imp-help', body).textContent = IMP_HELP[imp.mode];
+    });
+    go.addEventListener('click', () => readImport(ta.value));
+  });
+}
+async function pasteInto() {
+  const ta = $('#imp-text');
+  if (!ta) return;
+  try {
+    ta.value = await navigator.clipboard.readText();
+    ta.dispatchEvent(new Event('input', { bubbles: true }));
+  } catch { impMsg('Couldn’t read the clipboard. Press and hold in the box and choose Paste.'); }
+}
+function impMsg(t) { const m = $('#imp-msg'); if (m) { m.textContent = t; m.hidden = !t; } }
+
+function readImport(text) {
+  if (I.isLink(text)) return impMsg('Intake can’t open links itself: most recipe and restaurant sites block apps from reading their pages. Open the link in Safari, then copy the text (or use the Copy to Intake shortcut) and paste it here.');
+  const shared = I.readShared(text);
+  const title = shared ? String(shared.title || '').split(/\s[|–-]\s/)[0].trim() : '';
+  let res = shared && shared.ld ? I.fromLD(shared.ld, title) : null;
+  const body = shared ? (shared.selection || shared.text || '') : text;
+  if (!res && imp.mode === 'recipe') {
+    const r = I.parseRecipeText(body);
+    if (r.lines.length) res = { kind: 'recipe', name: r.name || title, servings: r.servings, lines: r.lines };
+  }
+  if (!res) {
+    const p = I.parseNutrition(body);
+    // A short first line that isn't part of the panel is usually the item's name.
+    const first = String(body).trim().split('\n')[0].trim();
+    const guess = first.length < 60 && !/\d|nutrition|serving|amount per/i.test(first) ? first : '';
+    if (p && (imp.mode === 'nutrition' || shared)) res = { kind: 'nutrition', name: title || guess, ...p };
+  }
+  if (!res) return impMsg(imp.mode === 'recipe'
+    ? 'Couldn’t find ingredient lines in that. Copy just the ingredient list (one per line, with amounts) and try again.'
+    : 'Couldn’t find calories in that. Copy the nutrition facts for a single item, including the Calories line.');
+  if (res.kind === 'recipe') {
+    S.draft = { id: null, name: res.name || '', servings: res.servings || null, items: res.lines.map(rawItem), site: res.site ? res.site.n : null };
+    commit(); openRecipe(); matchDraft();
+    return;
+  }
+  openCustom({ prefill: { name: res.name, serving: res.serving, servingG: res.servingG, n: res.n }, meal: search.meal,
+    note: 'Read from what you pasted. Check the numbers against the page, add a name, then save.' });
 }
 
 // --- barcode ---
@@ -568,12 +860,18 @@ document.addEventListener('click', e => {
   if (a === 'online') return runOnline();
   if (a === 'go-key') { closeSheet(); ui.tab = 'settings'; render(); const k = $('[data-set=usdaKey]'); if (k) { k.scrollIntoView({ block: 'center' }); k.focus(); } return; }
   if (a === 'custom') return openCustom({ meal: search.meal });
+  if (a === 'new-recipe') return newRecipe();
+  if (a === 'import') return openImport();
+  if (a === 'r-add') { pick = {}; search.q = ''; search.usda = search.off = null; return openAdd(search.meal); }
+  if (a === 'paste') return pasteInto();
   if (a === 'weigh') return openWeigh();
   if (a === 'export') return exportBackup();
   const back = t.closest('[data-back]');
-  if (back) return openAdd(search.meal);
+  if (back) return back.dataset.back === 'recipe' ? openRecipe() : openAdd(search.meal);
   const add = t.closest('[data-add]');
-  if (add) { search.q = ''; search.usda = search.off = null; return openAdd(add.dataset.add); }
+  if (add) { pick = null; search.q = ''; search.usda = search.off = null; return openAdd(add.dataset.add); }
+  const item = t.closest('[data-item]');
+  if (item) return openItem(item.dataset.item);
   const food = t.closest('[data-food]');
   if (food) { const f = search.results.get(food.dataset.food); if (f) openFood(f); return; }
   const entry = t.closest('[data-entry]');
